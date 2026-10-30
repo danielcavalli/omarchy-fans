@@ -1,0 +1,10 @@
+#!/bin/bash
+# Stops the service (the fans go back to the BIOS) and removes everything setup installed.
+set -euo pipefail
+sudo systemctl disable --now omarchy-fansd 2>/dev/null || true
+sudo rm -f /usr/local/bin/omarchy-fansd /usr/local/bin/omarchy-fans \
+  /etc/systemd/system/omarchy-fansd.service /etc/modules-load.d/omarchy-fans.conf
+sudo rm -rf /etc/omarchy-fans /var/lib/omarchy-fans
+sudo systemctl daemon-reload
+echo "omarchy-fans removed; the BIOS drives the fans again."
+echo "Remove the bar widget with: omarchy plugin remove rio.dan.fans"

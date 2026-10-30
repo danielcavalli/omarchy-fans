@@ -1,0 +1,22 @@
+#!/bin/bash
+# `omarchy plugin add` only clones files; this installs the root service that drives the fans,
+# finds your fan headers (or takes them as arguments) and starts it.
+#
+#   ./setup                                   probe each header and ask what is on it
+#   ./setup --intake 5 --radiator 2 --pump 7  skip probing
+
+set -euo pipefail
+
+root=$(cd "$(dirname "$0")" && pwd)
+
+sudo install -Dm755 "$root/daemon/omarchy-fansd" /usr/local/bin/omarchy-fansd
+sudo install -Dm755 "$root/bin/omarchy-fans" /usr/local/bin/omarchy-fans
+sudo install -Dm644 "$root/daemon/omarchy-fansd.service" /etc/systemd/system/omarchy-fansd.service
+sudo systemctl daemon-reload
+# Setup drives the headers itself while it probes.
+sudo systemctl stop omarchy-fansd 2>/dev/null || true
+sudo /usr/local/bin/omarchy-fansd setup "$@"
+sudo systemctl enable omarchy-fansd
+sudo systemctl restart omarchy-fansd
+sleep 3
+omarchy-fans status

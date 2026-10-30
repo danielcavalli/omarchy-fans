@@ -1,0 +1,185 @@
+#!/usr/bin/env python3
+"""omarchy-fans: read and steer the case fans that omarchy-fansd drives.
+
+  omarchy-fans status [--json]          temperatures, each fan group, the pumps
+  omarchy-fans profile [NAME]           quiet | balanced | cool | max | bios
+  omarchy-fans boost DUTY [DURATION]    e.g. `boost 100 15m`; `boost off` ends it
+  omarchy-fans curve show [GROUP]       the curves in use
+  omarchy-fans curve set GROUP SOURCE POINTS   e.g. `curve set intake gpu 40:40,60:65,72:100`
+  omarchy-fans curve reset [GROUP [SOURCE]]
+  omarchy-fans watch [--json]           one line per update
+  omarchy-fans setup [ARGS]             find the fan headers (runs `sudo omarchy-fansd setup`)
+
+Every command takes --json. Exit codes: 0 done, 1 refused, 2 the service is not running.
+"""
+
+import json
+import os
+import socket
+import sys
+
+SOCKET = os.environ.get("OMARCHY_FANS_SOCKET", "/run/omarchy-fans/socket")
+PROFILES = ("quiet", "balanced", "cool", "max", "bios")
+
+
+def connect():
+    s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    try:
+        s.connect(SOCKET)
+    except OSError as error:
+        fail(f"omarchy-fansd is not reachable at {SOCKET} ({error.strerror}); "
+             "is it set up? (omarchy-fans setup)", 2)
+    return s, s.makefile("rw")
+
+
+def request(payload):
+    _, f = connect()
+    f.write(json.dumps(payload) + "\n")
+    f.flush()
+    line = f.readline()
+    if not line:
+        fail("omarchy-fansd closed the connection", 2)
+    return json.loads(line)
+
+
+def fail(message, code=1):
+    if "--json" in sys.argv:
+        print(json.dumps({"ok": False, "error": message}))
+    else:
+        print(f"omarchy-fans: {message}", file=sys.stderr)
+    sys.exit(code)
+
+
+def temp(value):
+    return "--" if value is None else f"{value:.0f}°C"
+
+
+def describe(status):
+    lines = []
+    gpus = status.get("gpus") or []
+    gpu_extra = ""
+    if gpus:
+        parts = []
+        for card in gpus:
+            bits = [f"{card['watts']} W" if "watts" in card else "",
+                    f"card fans {card['fan']}%" if "fan" in card else ""]
+            parts.append(", ".join(b for b in bits if b))
+        gpu_extra = f" ({'; '.join(p for p in parts if p)})" if any(parts) else ""
+    lines.append(f"Profile {status['profile']}   CPU {temp(status['temps']['cpu'])}   "
+                 f"GPU {temp(status['temps']['gpu'])}{gpu_extra}")
+    if status.get("safety"):
+        lines.append(f"SAFETY: {', '.join(status['safety'])} at its limit, every group at 100%")
+    if status.get("boost"):
+        import time
+        left = max(0, int(status["boost"]["until"] - time.time()))
+        lines.append(f"Boost {status['boost']['duty']}% for {left // 60}m{left % 60:02d}s more")
+    width = max([len(g["label"]) for g in status["groups"].values()] + [4])
+    for key, g in status["groups"].items():
+        rpm = ", ".join(f"{r:,} rpm" for r in g["rpm"] if r is not None) or "no tach"
+        duty = "--" if g["duty"] is None else f"{g['duty']}%"
+        why = g["reason"]
+        if why in ("cpu", "gpu"):
+            why = f"following the {why.upper()}"
+        lines.append(f"  {g['label']:<{width}}  {duty:>4}  {rpm:<12}  {why}  [{key}]")
+    for p in status.get("pumps", []):
+        duty = "--" if p["duty"] is None else f"{p['duty']}%"
+        rpm = f"{p['rpm']:,} rpm" if p["rpm"] is not None else "no tach"
+        lines.append(f"  {'Pump':<{width}}  {duty:>4}  {rpm:<12}  BIOS, never touched  "
+                     f"[header {p['header']}]")
+    return "\n".join(lines)
+
+
+def show(reply, as_json, text=None):
+    if not reply.get("ok"):
+        fail(reply.get("error", "refused"))
+    if as_json:
+        print(json.dumps(reply))
+    else:
+        print(text if text is not None else describe(reply["status"]))
+
+
+def parse_points(text):
+    points = []
+    for pair in text.split(","):
+        t, _, d = pair.partition(":")
+        try:
+            points.append([float(t), float(d.rstrip("%"))])
+        except ValueError:
+            fail(f"points look like 40:40,60:65,72:100 (temperature:duty), not {text!r}")
+    return points
+
+
+def curves_text(status, only=None):
+    out = []
+    for key, g in status["groups"].items():
+        if only and key != only:
+            continue
+        out.append(f"{g['label']} [{key}], minimum {g['min']:g}%:")
+        for source, points in g["curves"].items():
+            out.append(f"  {source}: " + ", ".join(f"{t:g}°C {d:g}%" for t, d in points))
+    return "\n".join(out)
+
+
+def main():
+    args = [a for a in sys.argv[1:] if a != "--json"]
+    as_json = "--json" in sys.argv
+    if not args or args[0] in ("-h", "--help", "help"):
+        print(__doc__.strip())
+        return
+    cmd, rest = args[0], args[1:]
+    if cmd == "status":
+        show(request({"cmd": "status"}), as_json)
+    elif cmd == "profile":
+        if not rest:
+            reply = request({"cmd": "status"})
+            show(reply, as_json, reply.get("status", {}).get("profile"))
+        else:
+            show(request({"cmd": "profile", "name": rest[0]}), as_json)
+    elif cmd == "boost":
+        if not rest:
+            fail("boost DUTY [DURATION], or boost off")
+        if rest[0] == "off":
+            show(request({"cmd": "boost", "off": True}), as_json)
+        else:
+            show(request({"cmd": "boost", "duty": rest[0],
+                          "seconds": rest[1] if len(rest) > 1 else "15m"}), as_json)
+    elif cmd == "curve":
+        sub = rest[0] if rest else "show"
+        if sub == "show":
+            reply = request({"cmd": "status"})
+            show(reply, as_json, curves_text(reply.get("status", {}), rest[1] if len(rest) > 1 else None))
+        elif sub == "set":
+            if len(rest) != 4:
+                fail("curve set GROUP SOURCE POINTS, e.g. curve set intake gpu 40:40,60:65,72:100")
+            show(request({"cmd": "curve", "group": rest[1], "source": rest[2],
+                          "points": parse_points(rest[3])}), as_json)
+        elif sub == "reset":
+            payload = {"cmd": "curve-reset"}
+            if len(rest) > 1:
+                payload["group"] = rest[1]
+            if len(rest) > 2:
+                payload["source"] = rest[2]
+            show(request(payload), as_json)
+        else:
+            fail("curve show | set | reset")
+    elif cmd == "watch":
+        _, f = connect()
+        f.write(json.dumps({"cmd": "subscribe"}) + "\n")
+        f.flush()
+        try:
+            for line in f:
+                reply = json.loads(line)
+                if as_json:
+                    print(json.dumps(reply), flush=True)
+                else:
+                    print(describe(reply["status"]) + "\n", flush=True)
+        except KeyboardInterrupt:
+            pass
+    elif cmd == "setup":
+        os.execvp("sudo", ["sudo", "omarchy-fansd", "setup", *rest])
+    else:
+        fail(f"unknown command {cmd!r} (omarchy-fans --help)")
+
+
+if __name__ == "__main__":
+    main()

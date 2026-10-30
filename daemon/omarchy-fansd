@@ -1,0 +1,756 @@
+#!/usr/bin/env python3
+"""omarchy-fansd: case fans driven by the CPU and the graphics card together.
+
+The only part of omarchy-fans that touches hardware, so it runs as root. Every two seconds it
+reads the CPU and GPU temperatures, sets each fan group from its curves and serves its state on a
+Unix socket that the bar widget and the `omarchy-fans` command talk to.
+
+Safety lives here, whatever a client asks for:
+  * pump headers are never written; they stay on the BIOS setting
+  * every group goes to 100% when the CPU or the GPU reaches its limit
+  * every group keeps its minimum duty
+  * a temperature that cannot be read sends the groups that follow it to 100%
+  * stopping the service (or choosing the bios profile) hands every header back to the BIOS
+"""
+
+from __future__ import annotations
+
+import argparse
+import asyncio
+import ctypes
+import glob
+import grp
+import json
+import os
+import pwd
+import shutil
+import signal
+import subprocess
+import sys
+import time
+from pathlib import Path
+
+VERSION = "0.1.0"
+CONFIG = Path(os.environ.get("OMARCHY_FANS_CONFIG", "/etc/omarchy-fans/config.json"))
+STATE = Path(os.environ.get("OMARCHY_FANS_STATE", "/var/lib/omarchy-fans/state.json"))
+SOCKET = Path(os.environ.get("OMARCHY_FANS_SOCKET", "/run/omarchy-fans/socket"))
+HWMON = Path(os.environ.get("OMARCHY_FANS_HWMON", "/sys/class/hwmon"))
+TICK = 2.0
+PROFILES = ("quiet", "balanced", "cool", "max", "bios")
+SOURCES = ("cpu", "gpu")
+FALL_PER_TICK = 3  # duty points a fan may slow down per tick; speeding up is immediate
+SMOOTH_FALL = 0.25  # a falling temperature is averaged; a rising one is taken at once
+PROFILE_SHIFT = {"quiet": 5, "balanced": 0, "cool": -5}  # degrees the GPU curves move
+QUIET_MIN_DROP = 10
+FLOOR = 20  # no group's minimum goes below this
+LIMIT_RANGE = {"cpu": (60, 100), "gpu": (60, 95)}
+
+# Balanced curves for each kind of group: [temperature C, duty %] points.
+ROLES = {
+    "intake": {"min": 40, "curves": {
+        "cpu": [[50, 40], [70, 60], [85, 100]],
+        "gpu": [[40, 40], [55, 55], [65, 75], [72, 100]]}},
+    "exhaust": {"min": 35, "curves": {
+        "cpu": [[50, 35], [70, 55], [85, 100]],
+        "gpu": [[45, 35], [60, 60], [70, 85], [76, 100]]}},
+    "radiator": {"min": 30, "curves": {
+        "cpu": [[40, 35], [60, 50], [75, 75], [85, 100]],
+        "gpu": [[55, 35], [65, 55], [72, 80], [78, 100]]}},
+}
+ROLE_LABELS = {"intake": "Intake", "exhaust": "Exhaust", "radiator": "Radiator"}
+
+
+class ConfigError(Exception):
+    pass
+
+
+# ---------------------------------------------------------------- hardware
+
+def read_int(path: Path) -> int | None:
+    try:
+        return int(path.read_text().strip())
+    except (OSError, ValueError):
+        return None
+
+
+def write_int(path: Path, value: int) -> None:
+    path.write_text(f"{value}\n")
+
+
+def hwmon_named(prefix: str) -> list[Path]:
+    found = []
+    for name in sorted(HWMON.glob("hwmon*/name")):
+        try:
+            if name.read_text().strip().startswith(prefix):
+                found.append(name.parent)
+        except OSError:
+            pass
+    return found
+
+
+def fan_chips() -> list[Path]:
+    """hwmon devices with PWM headers (Super I/O chips such as nct67xx or it87)."""
+    return [d for d in sorted(HWMON.glob("hwmon*")) if (d / "pwm1").exists()]
+
+
+def chip_path(name: str) -> Path:
+    for d in fan_chips():
+        if (d / "name").read_text().strip() == name:
+            return d
+    raise ConfigError(f"no fan chip named {name} (is its driver loaded?)")
+
+
+def labelled(device: Path, label: str) -> Path | None:
+    for f in device.glob("temp*_label"):
+        try:
+            if f.read_text().strip() == label:
+                return f.with_name(f.name.replace("_label", "_input"))
+        except OSError:
+            pass
+    return None
+
+
+class Sensor:
+    """One temperature: '<hwmon name>:<label>' (the hottest of several devices with that name)."""
+
+    def __init__(self, spec: str):
+        self.spec = spec
+        self.chip, _, self.label = spec.partition(":")
+
+    def read(self) -> float | None:
+        values = []
+        for device in hwmon_named(self.chip):
+            path = labelled(device, self.label) if self.label else device / "temp1_input"
+            value = read_int(path) if path else None
+            if value is not None and -40000 < value < 150000:
+                values.append(value / 1000)
+        return max(values) if values else None
+
+
+class Nvidia:
+    """NVIDIA GPUs through NVML (the driver's own library); nvidia-smi if it cannot load."""
+
+    def __init__(self):
+        self.lib = None
+        try:
+            lib = ctypes.CDLL("libnvidia-ml.so.1")
+            if lib.nvmlInit_v2() == 0:
+                self.lib = lib
+        except OSError:
+            pass
+
+    def read(self) -> dict | None:
+        cards = self._nvml() if self.lib else self._smi()
+        if not cards:
+            return None
+        return {"temp": max(c["temp"] for c in cards), "cards": cards}
+
+    def _nvml(self) -> list[dict] | None:
+        lib, count = self.lib, ctypes.c_uint()
+        if lib.nvmlDeviceGetCount_v2(ctypes.byref(count)) != 0:
+            return None
+        cards = []
+        for i in range(count.value):
+            handle = ctypes.c_void_p()
+            if lib.nvmlDeviceGetHandleByIndex_v2(i, ctypes.byref(handle)) != 0:
+                continue
+            temp, power, fan = ctypes.c_uint(), ctypes.c_uint(), ctypes.c_uint()
+            if lib.nvmlDeviceGetTemperature(handle, 0, ctypes.byref(temp)) != 0:
+                continue
+            card = {"index": i, "temp": float(temp.value)}
+            if lib.nvmlDeviceGetPowerUsage(handle, ctypes.byref(power)) == 0:
+                card["watts"] = round(power.value / 1000)
+            if lib.nvmlDeviceGetFanSpeed(handle, ctypes.byref(fan)) == 0:
+                card["fan"] = int(fan.value)
+            cards.append(card)
+        return cards
+
+    def _smi(self) -> list[dict] | None:
+        if not shutil.which("nvidia-smi"):
+            return None
+        try:
+            out = subprocess.run(
+                ["nvidia-smi", "--query-gpu=index,temperature.gpu,power.draw,fan.speed",
+                 "--format=csv,noheader,nounits"], capture_output=True, text=True, timeout=5).stdout
+        except (OSError, subprocess.TimeoutExpired):
+            return None
+        cards = []
+        for line in out.strip().splitlines():
+            parts = [p.strip() for p in line.split(",")]
+            try:
+                card = {"index": int(parts[0]), "temp": float(parts[1])}
+            except (ValueError, IndexError):
+                continue
+            for key, raw in (("watts", parts[2:3]), ("fan", parts[3:4])):
+                try:
+                    card[key] = round(float(raw[0]))
+                except (ValueError, IndexError):
+                    pass
+            cards.append(card)
+        return cards
+
+
+class Amdgpu:
+    """A discrete AMD GPU, chosen by PCI address (an integrated one has the same driver name)."""
+
+    def __init__(self, pci: str):
+        self.pci = pci
+
+    def read(self) -> dict | None:
+        for device in hwmon_named("amdgpu"):
+            if Path(os.path.realpath(device / "device")).name != self.pci:
+                continue
+            path = labelled(device, "junction") or labelled(device, "edge")
+            value = read_int(path) if path else None
+            if value is not None:
+                card = {"index": 0, "temp": value / 1000}
+                watts = read_int(device / "power1_average") or read_int(device / "power1_input")
+                if watts:
+                    card["watts"] = round(watts / 1e6)
+                return {"temp": card["temp"], "cards": [card]}
+        return None
+
+
+# ---------------------------------------------------------------- curves
+
+def interpolate(points: list[list[float]], x: float) -> float:
+    if x <= points[0][0]:
+        return points[0][1]
+    for (x0, y0), (x1, y1) in zip(points, points[1:]):
+        if x <= x1:
+            return y0 + (y1 - y0) * (x - x0) / (x1 - x0)
+    return points[-1][1]
+
+
+def check_curve(points, source: str, limit: float) -> list[list[float]]:
+    """A curve the daemon will run: 2-8 points, temperatures rising, duty never falling, 100%
+    reached at or below the source's limit."""
+    if not isinstance(points, list) or not 2 <= len(points) <= 8:
+        raise ConfigError(f"a {source} curve has 2 to 8 points")
+    out = []
+    for p in points:
+        if not (isinstance(p, (list, tuple)) and len(p) == 2
+                and all(isinstance(v, (int, float)) for v in p)):
+            raise ConfigError("each point is [temperature, duty]")
+        t, d = float(p[0]), float(p[1])
+        if not (0 <= t <= 110 and 0 <= d <= 100):
+            raise ConfigError("temperatures are 0-110 C and duties 0-100 %")
+        out.append([t, d])
+    for (t0, d0), (t1, d1) in zip(out, out[1:]):
+        if t1 <= t0:
+            raise ConfigError("temperatures must rise from point to point")
+        if d1 < d0:
+            raise ConfigError("duty must never fall as the temperature rises")
+    if out[-1][1] < 100 or out[-1][0] > limit:
+        raise ConfigError(f"a {source} curve must reach 100% at or below the {source} limit "
+                          f"({limit:g} C)")
+    return out
+
+
+def shifted(points: list[list[float]], degrees: float) -> list[list[float]]:
+    return [[t + degrees, d] for t, d in points]
+
+
+def parse_duration(text: str) -> int:
+    text = str(text).strip().lower()
+    units = {"s": 1, "m": 60, "h": 3600}
+    if text and text[-1] in units:
+        return int(float(text[:-1]) * units[text[-1]])
+    return int(float(text))
+
+
+# ---------------------------------------------------------------- config and state
+
+def load_config() -> dict:
+    try:
+        raw = json.loads(CONFIG.read_text())
+    except FileNotFoundError:
+        raise ConfigError(f"{CONFIG} is missing: run `sudo omarchy-fansd setup`") from None
+    except json.JSONDecodeError as error:
+        raise ConfigError(f"{CONFIG}: {error}") from None
+    limits = {s: float(raw.get("limits", {}).get(s, LIMIT_RANGE[s][1] - 10)) for s in SOURCES}
+    for s, (lo, hi) in LIMIT_RANGE.items():
+        if not lo <= limits[s] <= hi:
+            raise ConfigError(f"the {s} limit must be {lo}-{hi} C")
+    pumps = [int(h) for h in raw.get("pumps", [])]
+    groups, seen = {}, set()
+    for key, g in (raw.get("groups") or {}).items():
+        role = g.get("role", "intake")
+        if role not in ROLES:
+            raise ConfigError(f"group {key}: role is one of {', '.join(ROLES)}")
+        headers = [int(h) for h in g.get("headers", [])]
+        if not headers:
+            raise ConfigError(f"group {key} has no headers")
+        for h in headers:
+            if h in pumps:
+                raise ConfigError(f"header {h} is a pump and cannot be in group {key}")
+            if h in seen:
+                raise ConfigError(f"header {h} is in two groups")
+            seen.add(h)
+        follows = [s for s in g.get("follows", list(SOURCES)) if s in SOURCES]
+        defaults = ROLES[role]
+        curves = {s: check_curve(g.get("curves", {}).get(s, defaults["curves"][s]), s, limits[s])
+                  for s in follows}
+        minimum = max(FLOOR, min(100, float(g.get("min", defaults["min"]))))
+        groups[key] = {"label": g.get("label", ROLE_LABELS[role]), "role": role,
+                       "headers": headers, "follows": follows, "min": minimum, "curves": curves}
+    gpu = raw.get("gpu", "none")
+    return {"chip": raw.get("chip", ""), "cpu": list(raw.get("cpu", [])), "gpu": gpu,
+            "limits": limits, "groups": groups, "pumps": pumps,
+            "socketGroup": raw.get("socketGroup", "")}
+
+
+def load_state() -> dict:
+    try:
+        state = json.loads(STATE.read_text())
+    except (OSError, json.JSONDecodeError):
+        state = {}
+    state.setdefault("profile", "balanced")
+    state.setdefault("curves", {})  # group -> source -> points (overrides the config's)
+    state.setdefault("bios", {})  # header -> its pwm_enable value before the daemon took it
+    state.setdefault("boost", None)
+    return state
+
+
+def save_state(state: dict) -> None:
+    STATE.parent.mkdir(parents=True, exist_ok=True)
+    tmp = STATE.with_suffix(".tmp")
+    tmp.write_text(json.dumps(state, indent=1))
+    tmp.replace(STATE)
+
+
+# ---------------------------------------------------------------- the controller
+
+class Controller:
+    def __init__(self, config: dict):
+        self.config = config
+        self.state = load_state()
+        self.chip = chip_path(config["chip"])
+        self.cpu = [Sensor(s) for s in config["cpu"]]
+        gpu = config["gpu"]
+        self.gpu = (Nvidia() if gpu == "nvidia" else
+                    Amdgpu(gpu.split(":", 1)[1]) if gpu.startswith("amdgpu:") else None)
+        self.smooth: dict[str, float | None] = {s: None for s in SOURCES}
+        self.duty = {k: 100.0 for k in config["groups"]}
+        self.status: dict = {}
+        self.subscribers: set[asyncio.StreamWriter] = set()
+        self.controlling = False
+
+    # headers
+    def header_path(self, header: int, suffix: str = "") -> Path:
+        return self.chip / f"pwm{header}{suffix}"
+
+    def take(self) -> None:
+        for g in self.config["groups"].values():
+            for h in g["headers"]:
+                enable = read_int(self.header_path(h, "_enable"))
+                if enable is not None and enable != 1 and str(h) not in self.state["bios"]:
+                    self.state["bios"][str(h)] = enable
+                if enable != 1:
+                    write_int(self.header_path(h, "_enable"), 1)
+        save_state(self.state)
+        self.controlling = True
+
+    def give_back(self) -> None:
+        for g in self.config["groups"].values():
+            for h in g["headers"]:
+                bios = self.state["bios"].get(str(h), 5)
+                try:
+                    write_int(self.header_path(h, "_enable"), int(bios))
+                except OSError:
+                    pass
+        self.controlling = False
+
+    # temperatures
+    def read_temps(self) -> tuple[dict, dict]:
+        raw = {"cpu": None, "gpu": None}
+        values = [v for v in (s.read() for s in self.cpu) if v is not None]
+        raw["cpu"] = max(values) if values else None
+        gpu = self.gpu.read() if self.gpu else None
+        raw["gpu"] = gpu["temp"] if gpu else None
+        for s in SOURCES:
+            t, prev = raw[s], self.smooth[s]
+            self.smooth[s] = t if t is None or prev is None or t >= prev else (
+                prev + SMOOTH_FALL * (t - prev))
+        return raw, (gpu or {})
+
+    def curves(self, key: str) -> dict:
+        g = self.config["groups"][key]
+        own = self.state["curves"].get(key, {})
+        return {s: own.get(s, g["curves"][s]) for s in g["follows"]}
+
+    def profile_curves(self, key: str) -> dict:
+        shift = PROFILE_SHIFT.get(self.state["profile"], 0)
+        return {s: shifted(c, shift) if s == "gpu" else c for s, c in self.curves(key).items()}
+
+    def minimum(self, key: str) -> float:
+        m = self.config["groups"][key]["min"]
+        return max(FLOOR, m - QUIET_MIN_DROP) if self.state["profile"] == "quiet" else m
+
+    def boost(self) -> dict | None:
+        b = self.state.get("boost")
+        if b and b["until"] > time.time():
+            return b
+        if b:
+            self.state["boost"] = None
+            save_state(self.state)
+        return None
+
+    def tick(self) -> None:
+        raw, gpu = self.read_temps()
+        limits, profile = self.config["limits"], self.state["profile"]
+        hot = [s for s in SOURCES if raw[s] is not None and raw[s] >= limits[s]]
+        boost = self.boost()
+        if profile == "bios":
+            if self.controlling:
+                self.give_back()
+        elif not self.controlling:
+            self.take()
+        groups = {}
+        for key, g in self.config["groups"].items():
+            curves = self.profile_curves(key)
+            asks = {}
+            for s in g["follows"]:
+                t = self.smooth[s]
+                asks[s] = 100.0 if t is None else interpolate(curves[s], t)
+            target, reason = (max(asks.values()), max(asks, key=asks.get)) if asks else (0.0, "")
+            missing = [s for s in g["follows"] if self.smooth[s] is None]
+            if missing:
+                reason = f"no {missing[0]} reading"
+            if target < self.minimum(key):
+                target, reason = self.minimum(key), "minimum"
+            if profile == "max":
+                target, reason = 100.0, "max"
+            if boost and boost["duty"] > target:
+                target, reason = float(boost["duty"]), "boost"
+            if hot:
+                target, reason = 100.0, f"{hot[0]} at its limit"
+            current = self.duty[key]
+            current = target if target >= current else max(target, current - FALL_PER_TICK)
+            self.duty[key] = current
+            if profile != "bios":
+                value = round(current * 255 / 100)
+                for h in g["headers"]:
+                    if read_int(self.header_path(h, "_enable")) != 1:  # e.g. after a resume
+                        write_int(self.header_path(h, "_enable"), 1)
+                    if read_int(self.header_path(h)) != value:
+                        write_int(self.header_path(h), value)
+            groups[key] = {
+                "label": g["label"], "role": g["role"], "headers": g["headers"],
+                "duty": round(current) if profile != "bios" else self.read_duty(g["headers"]),
+                "target": round(target) if profile != "bios" else None,
+                "reason": reason if profile != "bios" else "bios",
+                "asks": {s: round(v) for s, v in asks.items()},
+                "rpm": [read_int(self.chip / f"fan{h}_input") for h in g["headers"]],
+                "min": self.minimum(key), "curves": curves}
+        pumps = [{"header": h, "rpm": read_int(self.chip / f"fan{h}_input"),
+                  "duty": self.read_duty([h])} for h in self.config["pumps"]]
+        self.status = {
+            "version": VERSION, "time": time.time(), "profile": profile,
+            "boost": boost, "limits": limits, "safety": hot,
+            "temps": {"cpu": raw["cpu"], "gpu": raw["gpu"]},
+            "smoothed": {s: (round(v, 1) if v is not None else None)
+                         for s, v in self.smooth.items()},
+            "gpus": gpu.get("cards", []), "groups": groups, "pumps": pumps}
+
+    def read_duty(self, headers: list[int]) -> int | None:
+        values = [read_int(self.header_path(h)) for h in headers]
+        values = [v for v in values if v is not None]
+        return round(max(values) * 100 / 255) if values else None
+
+    # commands
+    def command(self, request: dict) -> dict:
+        cmd = request.get("cmd")
+        if cmd in ("status", "subscribe"):
+            return {"ok": True, "status": self.status}
+        if cmd == "config":
+            return {"ok": True, "config": self.config}
+        if cmd == "profile":
+            name = request.get("name")
+            if name not in PROFILES:
+                return {"ok": False, "error": f"profile is one of {', '.join(PROFILES)}"}
+            self.state["profile"] = name
+        elif cmd == "boost":
+            if request.get("off"):
+                self.state["boost"] = None
+            else:
+                try:
+                    duty = max(0, min(100, int(request.get("duty", 100))))
+                    seconds = parse_duration(request.get("seconds", 900))
+                except (TypeError, ValueError):
+                    return {"ok": False, "error": "boost takes a duty (0-100) and a duration"}
+                if not 0 < seconds <= 24 * 3600:
+                    return {"ok": False, "error": "a boost lasts up to 24 hours"}
+                self.state["boost"] = {"duty": duty, "until": time.time() + seconds}
+        elif cmd == "curve":
+            key, source = request.get("group"), request.get("source")
+            if key not in self.config["groups"]:
+                return {"ok": False, "error": f"group is one of {', '.join(self.config['groups'])}"}
+            if source not in self.config["groups"][key]["follows"]:
+                return {"ok": False, "error": f"group {key} follows "
+                        f"{', '.join(self.config['groups'][key]['follows'])}"}
+            try:
+                points = check_curve(request.get("points"), source,
+                                     self.config["limits"][source])
+            except ConfigError as error:
+                return {"ok": False, "error": str(error)}
+            self.state["curves"].setdefault(key, {})[source] = points
+        elif cmd == "curve-reset":
+            key, source = request.get("group"), request.get("source")
+            if key is None:
+                self.state["curves"] = {}
+            elif source is None:
+                self.state["curves"].pop(key, None)
+            else:
+                self.state["curves"].get(key, {}).pop(source, None)
+        else:
+            return {"ok": False, "error": f"unknown command {cmd!r}"}
+        save_state(self.state)
+        self.tick()
+        return {"ok": True, "status": self.status}
+
+
+# ---------------------------------------------------------------- serving
+
+async def serve(controller: Controller) -> None:
+    SOCKET.parent.mkdir(parents=True, exist_ok=True)
+    if SOCKET.exists():
+        SOCKET.unlink()
+
+    async def client(reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
+        try:
+            while line := await reader.readline():
+                try:
+                    request = json.loads(line)
+                    reply = controller.command(request if isinstance(request, dict) else {})
+                except json.JSONDecodeError:
+                    request, reply = {}, {"ok": False, "error": "send one JSON object per line"}
+                writer.write((json.dumps(reply) + "\n").encode())
+                await writer.drain()
+                if request.get("cmd") == "subscribe":
+                    controller.subscribers.add(writer)
+        except (ConnectionError, asyncio.IncompleteReadError):
+            pass
+        finally:
+            controller.subscribers.discard(writer)
+            writer.close()
+
+    server = await asyncio.start_unix_server(client, path=str(SOCKET), limit=1 << 16)
+    group = controller.config["socketGroup"]
+    gid = grp.getgrnam(group).gr_gid if group else -1
+    if os.geteuid() == 0:
+        os.chown(SOCKET, 0, gid)
+    os.chmod(SOCKET, 0o660 if group else 0o666)
+
+    loop = asyncio.get_running_loop()
+    stop = loop.create_future()
+    for sig in (signal.SIGTERM, signal.SIGINT):
+        loop.add_signal_handler(sig, lambda: stop.done() or stop.set_result(None))
+
+    async def ticking() -> None:
+        while True:
+            try:
+                controller.tick()
+            except OSError as error:
+                print(f"tick failed: {error}", file=sys.stderr, flush=True)
+            line = (json.dumps({"ok": True, "status": controller.status}) + "\n").encode()
+            for writer in list(controller.subscribers):
+                try:
+                    writer.write(line)
+                except (ConnectionError, RuntimeError):
+                    controller.subscribers.discard(writer)
+            await asyncio.sleep(TICK)
+
+    task = asyncio.create_task(ticking())
+    try:
+        await stop
+    finally:
+        task.cancel()
+        server.close()
+        controller.give_back()
+        if SOCKET.exists():
+            SOCKET.unlink()
+
+
+def run() -> None:
+    try:
+        controller = Controller(load_config())
+    except ConfigError as error:
+        sys.exit(f"omarchy-fansd: {error}")
+    try:
+        asyncio.run(serve(controller))
+    finally:
+        controller.give_back()
+
+
+# ---------------------------------------------------------------- setup
+
+def ask(prompt: str, choices: str) -> str:
+    while True:
+        answer = input(prompt).strip().lower()[:1]
+        if answer in choices:
+            return answer
+
+
+def describe_headers(chip: Path) -> list[dict]:
+    headers = []
+    for pwm in sorted(chip.glob("pwm[0-9]"), key=lambda p: int(p.name[3:])):
+        n = int(pwm.name[3:])
+        points = [read_int(chip / f"pwm{n}_auto_point{p}_pwm") for p in range(1, 6)]
+        flat_full = all(v == 255 for v in points if v is not None) and any(
+            v is not None for v in points)
+        headers.append({"header": n, "rpm": read_int(chip / f"fan{n}_input"),
+                        "duty": round((read_int(pwm) or 0) * 100 / 255),
+                        "enable": read_int(chip / f"pwm{n}_enable"), "likely_pump": flat_full})
+    return headers
+
+
+def probe(chip: Path, header: int) -> tuple[int | None, int | None]:
+    enable = chip / f"pwm{header}_enable"
+    before = read_int(enable)
+    rpm = {}
+    try:
+        write_int(enable, 1)
+        for duty in (64, 255):
+            write_int(chip / f"pwm{header}", duty)
+            print(f"  header {header} at {round(duty * 100 / 255)}% ...", flush=True)
+            time.sleep(8)
+            rpm[duty] = read_int(chip / f"fan{header}_input")
+    finally:
+        write_int(enable, before if before is not None else 5)
+    return rpm.get(64), rpm.get(255)
+
+
+def detect_cpu() -> list[str]:
+    sources = []
+    if hwmon_named("k10temp"):
+        sources.append("k10temp:Tctl")
+    elif hwmon_named("coretemp"):
+        sources.append("coretemp:Package id 0")
+    for chip in fan_chips():
+        if labelled(chip, "TSI0_TEMP"):  # the board's own reading of an AMD CPU
+            sources.append(f"{(chip / 'name').read_text().strip()}:TSI0_TEMP")
+    return sources
+
+
+def detect_gpu() -> str:
+    if Nvidia().read():
+        return "nvidia"
+    for device in hwmon_named("amdgpu"):
+        vram = read_int(device / "device" / "mem_info_vram_total") or 0
+        if vram > 4 * 2**30:  # an integrated GPU carves out far less
+            return f"amdgpu:{Path(os.path.realpath(device / 'device')).name}"
+    return "none"
+
+
+def setup(args: argparse.Namespace) -> None:
+    if os.geteuid() != 0:
+        sys.exit("setup writes /etc/omarchy-fans/config.json: run it with sudo")
+    if not fan_chips():
+        for module in ("nct6775", "it87"):
+            subprocess.run(["modprobe", module], capture_output=True)
+            if fan_chips():
+                break
+    chips = fan_chips()
+    if not chips:
+        sys.exit("no fan controller with PWM headers was found (nct6775 or it87)")
+    chip = chips[0]
+    chip_name = (chip / "name").read_text().strip()
+    driver = Path(os.path.realpath(chip / "device" / "driver")).name.split(".")[0]
+    headers = describe_headers(chip)
+    print(f"Fan controller: {chip_name}")
+    for h in headers:
+        print(f"  header {h['header']}: {h['rpm'] or 0} rpm at {h['duty']}%"
+              + ("  (flat 100% BIOS curve: likely a pump)" if h["likely_pump"] else ""))
+
+    roles: dict[int, str] = {}
+    for h in args.intake or []:
+        roles[h] = "intake"
+    for h in args.exhaust or []:
+        roles[h] = "exhaust"
+    for h in args.radiator or []:
+        roles[h] = "radiator"
+    pumps = set(args.pump or [])
+    if not roles:
+        print("\nEach header goes to 25%, then 100%, for 8 s each. Watch and listen to your fans.")
+        for h in headers:
+            n = h["header"]
+            if h["likely_pump"] or n in pumps:
+                if ask(f"Header {n} looks like a pump. Leave it alone? [y/n] ", "yn") == "y":
+                    pumps.add(n)
+                    continue
+            low, high = probe(chip, n)
+            print(f"  header {n}: {low or 0} rpm at 25%, {high or 0} rpm at 100%")
+            answer = ask(f"What is on header {n}? [i]ntake  [e]xhaust  [r]adiator fans  "
+                         "[p]ump  [n]othing: ", "ierpn")
+            if answer == "p":
+                pumps.add(n)
+            elif answer != "n":
+                roles[n] = {"i": "intake", "e": "exhaust", "r": "radiator"}[answer]
+    if not roles:
+        sys.exit("no fan headers were chosen")
+    groups = {}
+    for role in ROLES:
+        mine = sorted(h for h, r in roles.items() if r == role)
+        if mine:
+            groups[role] = {"label": ROLE_LABELS[role], "role": role, "headers": mine}
+    user = os.environ.get("SUDO_USER") or ""
+    socket_group = args.group or (grp.getgrgid(pwd.getpwnam(user).pw_gid).gr_name if user else "")
+    config = {"chip": chip_name, "driver": driver, "cpu": detect_cpu(), "gpu": detect_gpu(),
+              "limits": {"cpu": 90, "gpu": 85}, "groups": groups, "pumps": sorted(pumps),
+              "socketGroup": socket_group}
+    CONFIG.parent.mkdir(parents=True, exist_ok=True)
+    CONFIG.write_text(json.dumps(config, indent=2) + "\n")
+    load_config()  # what was written must load
+    modules = Path("/etc/modules-load.d/omarchy-fans.conf")
+    if driver and not os.environ.get("OMARCHY_FANS_CONFIG"):
+        modules.write_text(f"{driver}\n")
+    print(f"\nWrote {CONFIG}:")
+    print(json.dumps(config, indent=2))
+
+
+def release() -> None:
+    """Hand every configured header back to the BIOS (what systemd runs after the service ends,
+    even if it crashed)."""
+    try:
+        config = load_config()
+        chip = chip_path(config["chip"])
+    except ConfigError as error:
+        sys.exit(f"omarchy-fansd: {error}")
+    bios = load_state()["bios"]
+    for g in config["groups"].values():
+        for h in g["headers"]:
+            try:
+                write_int(chip / f"pwm{h}_enable", int(bios.get(str(h), 5)))
+            except OSError as error:
+                print(f"header {h}: {error}", file=sys.stderr)
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(prog="omarchy-fansd", description=__doc__.split("\n")[0])
+    sub = parser.add_subparsers(dest="cmd")
+    sub.add_parser("run", help="control the fans (what the service runs)")
+    s = sub.add_parser("setup", help="find the fan headers and write the config (root)")
+    for role in ("intake", "exhaust", "radiator", "pump"):
+        s.add_argument(f"--{role}", type=int, action="append", metavar="HEADER",
+                       help=f"a header with {role} fans (skips probing)" if role != "pump"
+                       else "a pump header, never written")
+    s.add_argument("--group", help="the group allowed to use the socket (default: yours)")
+    sub.add_parser("headers", help="list the fan headers")
+    sub.add_parser("release", help="hand every configured header back to the BIOS")
+    parser.add_argument("--version", action="version", version=VERSION)
+    args = parser.parse_args()
+    if args.cmd == "setup":
+        setup(args)
+    elif args.cmd == "release":
+        release()
+    elif args.cmd == "headers":
+        for chip in fan_chips():
+            print((chip / "name").read_text().strip())
+            print(json.dumps(describe_headers(chip), indent=1))
+    else:
+        run()
+
+
+if __name__ == "__main__":
+    main()

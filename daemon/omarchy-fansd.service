@@ -1,0 +1,19 @@
+[Unit]
+Description=omarchy-fans: case fans driven by the CPU and the GPU
+After=systemd-modules-load.service nvidia-persistenced.service
+
+[Service]
+ExecStart=/usr/local/bin/omarchy-fansd run
+# Whatever ended the service, the headers go back to the BIOS.
+ExecStopPost=/usr/local/bin/omarchy-fansd release
+Restart=on-failure
+RestartSec=3
+RuntimeDirectory=omarchy-fans
+StateDirectory=omarchy-fans
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+NoNewPrivileges=yes
+
+[Install]
+WantedBy=multi-user.target

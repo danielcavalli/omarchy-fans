@@ -1,0 +1,34 @@
+{
+  "schemaVersion": 1,
+  "id": "rio.dan.fans",
+  "name": "Fans",
+  "version": "0.1.0",
+  "author": "Daniel Cavalli",
+  "license": "MIT",
+  "description": "Case fans driven by the CPU and the graphics card together: live curves, profiles and a boost in the bar, and a command AI agents can use.",
+  "kinds": [
+    "bar-widget"
+  ],
+  "entryPoints": {
+    "barWidget": "Panel.qml"
+  },
+  "barWidget": {
+    "displayName": "Fans",
+    "description": "The hotter of the CPU and GPU in the bar; fan groups, their curves, profiles and a boost in the panel.",
+    "category": "System",
+    "allowMultiple": false,
+    "defaultSection": "right",
+    "defaults": {
+      "socketPath": "/run/omarchy-fans/socket"
+    },
+    "schema": [
+      {
+        "key": "socketPath",
+        "type": "path",
+        "label": "omarchy-fansd socket",
+        "description": "Where the fan service listens.",
+        "defaultValue": "/run/omarchy-fans/socket"
+      }
+    ]
+  }
+}

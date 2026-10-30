@@ -40,16 +40,11 @@ omarchy plugin add https://github.com/danielcavalli/omarchy-fans.git --enable
 ~/.config/omarchy/plugins/rio.dan.fans/setup
 ```
 
-`setup` asks for `sudo` once. It installs the service and the command, loads the fan driver at
-every boot, then steps each fan header to 25% and to 100% for a few seconds and asks what is on
-it (intake, exhaust, radiator fans, a pump, or nothing). Headers whose BIOS curve is a flat 100%
-are offered as pumps and left alone. If you already know your headers:
-
-```bash
-~/.config/omarchy/plugins/rio.dan.fans/setup --intake 5 --radiator 2 --pump 7
-```
-
-`omarchy-fansd headers` lists them with their speeds. Run `setup` again any time to redo it.
+`setup` asks for `sudo` once. It installs the service and the command and loads the fan driver
+at every boot. It asks nothing: a header the BIOS runs at a flat 100% that spins like a pump (or
+reports no speed) is the pump, never touched; every other header is fans. It prints what it
+found. If it gets the pump wrong, name it: `setup --pump 7`. `omarchy-fansd headers` lists the
+headers with their speeds; run `setup` again any time to redo it.
 
 ## Use
 
@@ -77,7 +72,7 @@ omarchy-fans status                    # or --json
 omarchy-fans profile cool
 omarchy-fans boost 100 30m             # boost off
 omarchy-fans curve show
-omarchy-fans curve set intake gpu 40:40,60:65,72:100
+omarchy-fans curve set fans gpu 40:40,60:65,72:100
 omarchy-fans curve reset
 omarchy-fans watch --json              # a line per update
 ```
@@ -86,15 +81,16 @@ Shell IPC works too: `omarchy-shell rio.dan.fans status|profile <name>|boost <du
 
 ## Default curves (balanced)
 
-| Group | CPU | GPU | Minimum |
-|---|---|---|---|
-| intake | 50 °C 40% → 70 °C 60% → 85 °C 100% | 40 °C 40% → 55 °C 55% → 65 °C 75% → 72 °C 100% | 40% |
-| exhaust | 50 °C 35% → 70 °C 55% → 85 °C 100% | 45 °C 35% → 60 °C 60% → 70 °C 85% → 76 °C 100% | 35% |
-| radiator | 40 °C 35% → 60 °C 50% → 75 °C 75% → 85 °C 100% | 55 °C 35% → 65 °C 55% → 72 °C 80% → 78 °C 100% | 30% |
+| | Curve | Minimum |
+|---|---|---|
+| CPU | 40 °C 35% → 60 °C 50% → 75 °C 75% → 85 °C 100% | 35% |
+| GPU | 40 °C 40% → 55 °C 55% → 65 °C 75% → 72 °C 100% | |
 
-A top-mounted AIO radiator exhausts the case, so its fans follow the GPU too. Edits made with
-`curve set` are kept in `/var/lib/omarchy-fans/state.json`; the hardware layout and limits are
-in `/etc/omarchy-fans/config.json`.
+Every fan follows both, CPU fan and AIO radiator fans included, so the CPU never gets less air
+than its own curve asks and the case clears the GPU's heat. Edits made with `curve set` are kept
+in `/var/lib/omarchy-fans/state.json`; the headers and limits are in
+`/etc/omarchy-fans/config.json`, where the fans can be split into more groups, each with its own
+curves.
 
 ## Temperatures
 

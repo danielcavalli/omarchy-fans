@@ -75,7 +75,7 @@ def describe(status):
         lines.append(f"Boost {status['boost']['duty']}% for {left // 60}m{left % 60:02d}s more")
     width = max([len(g["label"]) for g in status["groups"].values()] + [4])
     for key, g in status["groups"].items():
-        rpm = ", ".join(f"{r:,} rpm" for r in g["rpm"] if r is not None) or "no tach"
+        rpm = " · ".join(f"{r:,}" for r in g["rpm"] if r) + " rpm" if any(g["rpm"]) else "no tach"
         duty = "--" if g["duty"] is None else f"{g['duty']}%"
         why = g["reason"]
         if why in ("cpu", "gpu"):

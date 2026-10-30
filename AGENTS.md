@@ -16,10 +16,11 @@ omarchy-fans status --json
   "limits": {"cpu": 90, "gpu": 85},
   "temps": {"cpu": 69.0, "gpu": 78.0}, "smoothed": {"cpu": 69.0, "gpu": 78.0},
   "gpus": [{"index": 0, "temp": 78.0, "watts": 280, "fan": 98}],
-  "groups": {"intake": {"label": "Intake", "headers": [5], "duty": 100, "target": 100,
-                        "reason": "gpu", "asks": {"cpu": 63, "gpu": 100}, "rpm": [1520],
-                        "min": 40, "curves": {"cpu": [[50, 40], [70, 60], [85, 100]],
-                                              "gpu": [[40, 40], [55, 55], [65, 75], [72, 100]]}}},
+  "groups": {"fans": {"label": "Fans", "headers": [1, 2, 3, 4, 5, 6], "duty": 100,
+                      "target": 100, "reason": "gpu", "asks": {"cpu": 63, "gpu": 100},
+                      "rpm": [0, 1050, 0, 0, 1520, 0], "min": 35,
+                      "curves": {"cpu": [[40, 35], [60, 50], [75, 75], [85, 100]],
+                                 "gpu": [[40, 40], [55, 55], [65, 75], [72, 100]]}}},
   "pumps": [{"header": 7, "rpm": 2710, "duty": 100}]}}
 ```
 
@@ -50,6 +51,6 @@ A curve has 2-8 points of `temperature:duty`, temperatures rising, duty never fa
 The CLI and the bar speak JSON lines on `/run/omarchy-fans/socket` (group-restricted to the
 user who ran setup): `{"cmd": "status"}`, `{"cmd": "subscribe"}` (a status every 2 s),
 `{"cmd": "profile", "name": "cool"}`, `{"cmd": "boost", "duty": 100, "seconds": "15m"}`,
-`{"cmd": "boost", "off": true}`, `{"cmd": "curve", "group": "intake", "source": "gpu",
+`{"cmd": "boost", "off": true}`, `{"cmd": "curve", "group": "fans", "source": "gpu",
 "points": [[40, 40], [72, 100]]}`, `{"cmd": "curve-reset"}`, `{"cmd": "config"}`.
 Every reply is `{"ok": true, "status": ...}` or `{"ok": false, "error": "..."}`.

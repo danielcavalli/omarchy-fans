@@ -1,9 +1,10 @@
 #!/bin/bash
 # `omarchy plugin add` only clones files; this installs the root service that drives the fans,
-# finds your fan headers (or takes them as arguments) and starts it.
+# finds the pump (a header the BIOS runs at a flat 100%, spinning like a pump) and leaves it alone,
+# puts every other header in one group of fans, and starts the service.
 #
-#   ./setup                                   probe each header and ask what is on it
-#   ./setup --intake 5 --radiator 2 --pump 7  skip probing
+#   ./setup                      find the pump by itself
+#   ./setup --pump 7             name the pump instead
 
 set -euo pipefail
 

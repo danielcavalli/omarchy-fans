@@ -53,9 +53,9 @@ function reasonText(reason) {
 function rpmText(list) {
   var out = []
   for (var i = 0; i < (list || []).length; i++) {
-    if (list[i] !== null && list[i] !== undefined) out.push(Number(list[i]).toLocaleString(Qt.locale("en_US"), "f", 0) + " rpm")
+    if (list[i]) out.push(Number(list[i]).toLocaleString(Qt.locale("en_US"), "f", 0))
   }
-  return out.length > 0 ? out.join(", ") : "no tach"
+  return out.length > 0 ? out.join(" · ") + " rpm" : "no tach"
 }
 
 function boostLeft(status) {

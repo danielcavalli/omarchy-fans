@@ -45,19 +45,14 @@ QUIET_MIN_DROP = 10
 FLOOR = 20  # no group's minimum goes below this
 LIMIT_RANGE = {"cpu": (60, 100), "gpu": (60, 95)}
 
-# Balanced curves for each kind of group: [temperature C, duty %] points.
-ROLES = {
-    "intake": {"min": 40, "curves": {
-        "cpu": [[50, 40], [70, 60], [85, 100]],
-        "gpu": [[40, 40], [55, 55], [65, 75], [72, 100]]}},
-    "exhaust": {"min": 35, "curves": {
-        "cpu": [[50, 35], [70, 55], [85, 100]],
-        "gpu": [[45, 35], [60, 60], [70, 85], [76, 100]]}},
-    "radiator": {"min": 30, "curves": {
-        "cpu": [[40, 35], [60, 50], [75, 75], [85, 100]],
-        "gpu": [[55, 35], [65, 55], [72, 80], [78, 100]]}},
+# The balanced curves of the fans: [temperature C, duty %] points. Setup puts every header that
+# is not a pump in one group; the config can split them into more, each with its own curves.
+DEFAULT_CURVES = {
+    "cpu": [[40, 35], [60, 50], [75, 75], [85, 100]],
+    "gpu": [[40, 40], [55, 55], [65, 75], [72, 100]],
 }
-ROLE_LABELS = {"intake": "Intake", "exhaust": "Exhaust", "radiator": "Radiator"}
+DEFAULT_MIN = 35
+PUMP_RPM = 2000  # a tach at or above this on a flat-100% header is a pump
 
 
 class ConfigError(Exception):
@@ -275,9 +270,6 @@ def load_config() -> dict:
     pumps = [int(h) for h in raw.get("pumps", [])]
     groups, seen = {}, set()
     for key, g in (raw.get("groups") or {}).items():
-        role = g.get("role", "intake")
-        if role not in ROLES:
-            raise ConfigError(f"group {key}: role is one of {', '.join(ROLES)}")
         headers = [int(h) for h in g.get("headers", [])]
         if not headers:
             raise ConfigError(f"group {key} has no headers")
@@ -288,12 +280,11 @@ def load_config() -> dict:
                 raise ConfigError(f"header {h} is in two groups")
             seen.add(h)
         follows = [s for s in g.get("follows", list(SOURCES)) if s in SOURCES]
-        defaults = ROLES[role]
-        curves = {s: check_curve(g.get("curves", {}).get(s, defaults["curves"][s]), s, limits[s])
+        curves = {s: check_curve(g.get("curves", {}).get(s, DEFAULT_CURVES[s]), s, limits[s])
                   for s in follows}
-        minimum = max(FLOOR, min(100, float(g.get("min", defaults["min"]))))
-        groups[key] = {"label": g.get("label", ROLE_LABELS[role]), "role": role,
-                       "headers": headers, "follows": follows, "min": minimum, "curves": curves}
+        minimum = max(FLOOR, min(100, float(g.get("min", DEFAULT_MIN))))
+        groups[key] = {"label": g.get("label", key.capitalize()), "headers": headers,
+                       "follows": follows, "min": minimum, "curves": curves}
     gpu = raw.get("gpu", "none")
     return {"chip": raw.get("chip", ""), "cpu": list(raw.get("cpu", [])), "gpu": gpu,
             "limits": limits, "groups": groups, "pumps": pumps,
@@ -436,7 +427,7 @@ class Controller:
                     if read_int(self.header_path(h)) != value:
                         write_int(self.header_path(h), value)
             groups[key] = {
-                "label": g["label"], "role": g["role"], "headers": g["headers"],
+                "label": g["label"], "headers": g["headers"],
                 "duty": round(current) if profile != "bios" else self.read_duty(g["headers"]),
                 "target": round(target) if profile != "bios" else None,
                 "reason": reason if profile != "bios" else "bios",
@@ -585,40 +576,23 @@ def run() -> None:
 
 # ---------------------------------------------------------------- setup
 
-def ask(prompt: str, choices: str) -> str:
-    while True:
-        answer = input(prompt).strip().lower()[:1]
-        if answer in choices:
-            return answer
-
-
 def describe_headers(chip: Path) -> list[dict]:
     headers = []
     for pwm in sorted(chip.glob("pwm[0-9]"), key=lambda p: int(p.name[3:])):
         n = int(pwm.name[3:])
         points = [read_int(chip / f"pwm{n}_auto_point{p}_pwm") for p in range(1, 6)]
-        flat_full = all(v == 255 for v in points if v is not None) and any(
-            v is not None for v in points)
+        known = [v for v in points if v is not None]
         headers.append({"header": n, "rpm": read_int(chip / f"fan{n}_input"),
                         "duty": round((read_int(pwm) or 0) * 100 / 255),
-                        "enable": read_int(chip / f"pwm{n}_enable"), "likely_pump": flat_full})
+                        "enable": read_int(chip / f"pwm{n}_enable"),
+                        "flat_full": bool(known) and all(v == 255 for v in known)})
     return headers
 
 
-def probe(chip: Path, header: int) -> tuple[int | None, int | None]:
-    enable = chip / f"pwm{header}_enable"
-    before = read_int(enable)
-    rpm = {}
-    try:
-        write_int(enable, 1)
-        for duty in (64, 255):
-            write_int(chip / f"pwm{header}", duty)
-            print(f"  header {header} at {round(duty * 100 / 255)}% ...", flush=True)
-            time.sleep(8)
-            rpm[duty] = read_int(chip / f"fan{header}_input")
-    finally:
-        write_int(enable, before if before is not None else 5)
-    return rpm.get(64), rpm.get(255)
+def is_pump(header: dict) -> bool:
+    """Boards run a pump header at a flat 100% (every point of its BIOS curve full), and a pump
+    spins faster than a fan."""
+    return header["flat_full"] and (not header["rpm"] or header["rpm"] >= PUMP_RPM)
 
 
 def detect_cpu() -> list[str]:
@@ -658,42 +632,15 @@ def setup(args: argparse.Namespace) -> None:
     chip_name = (chip / "name").read_text().strip()
     driver = Path(os.path.realpath(chip / "device" / "driver")).name.split(".")[0]
     headers = describe_headers(chip)
+    pumps = set(args.pump) if args.pump else {h["header"] for h in headers if is_pump(h)}
+    fans = sorted(set(args.fans) if args.fans else {h["header"] for h in headers} - pumps)
     print(f"Fan controller: {chip_name}")
     for h in headers:
-        print(f"  header {h['header']}: {h['rpm'] or 0} rpm at {h['duty']}%"
-              + ("  (flat 100% BIOS curve: likely a pump)" if h["likely_pump"] else ""))
-
-    roles: dict[int, str] = {}
-    for h in args.intake or []:
-        roles[h] = "intake"
-    for h in args.exhaust or []:
-        roles[h] = "exhaust"
-    for h in args.radiator or []:
-        roles[h] = "radiator"
-    pumps = set(args.pump or [])
-    if not roles:
-        print("\nEach header goes to 25%, then 100%, for 8 s each. Watch and listen to your fans.")
-        for h in headers:
-            n = h["header"]
-            if h["likely_pump"] or n in pumps:
-                if ask(f"Header {n} looks like a pump. Leave it alone? [y/n] ", "yn") == "y":
-                    pumps.add(n)
-                    continue
-            low, high = probe(chip, n)
-            print(f"  header {n}: {low or 0} rpm at 25%, {high or 0} rpm at 100%")
-            answer = ask(f"What is on header {n}? [i]ntake  [e]xhaust  [r]adiator fans  "
-                         "[p]ump  [n]othing: ", "ierpn")
-            if answer == "p":
-                pumps.add(n)
-            elif answer != "n":
-                roles[n] = {"i": "intake", "e": "exhaust", "r": "radiator"}[answer]
-    if not roles:
-        sys.exit("no fan headers were chosen")
-    groups = {}
-    for role in ROLES:
-        mine = sorted(h for h, r in roles.items() if r == role)
-        if mine:
-            groups[role] = {"label": ROLE_LABELS[role], "role": role, "headers": mine}
+        what = "pump, never touched" if h["header"] in pumps else "fans"
+        print(f"  header {h['header']}: {h['rpm'] or 0} rpm at {h['duty']}%  {what}")
+    if not fans:
+        sys.exit("no fan headers")
+    groups = {"fans": {"label": "Fans", "headers": fans}}
     user = os.environ.get("SUDO_USER") or ""
     socket_group = args.group or (grp.getgrgid(pwd.getpwnam(user).pw_gid).gr_name if user else "")
     config = {"chip": chip_name, "driver": driver, "cpu": detect_cpu(), "gpu": detect_gpu(),
@@ -730,11 +677,11 @@ def main() -> None:
     parser = argparse.ArgumentParser(prog="omarchy-fansd", description=__doc__.split("\n")[0])
     sub = parser.add_subparsers(dest="cmd")
     sub.add_parser("run", help="control the fans (what the service runs)")
-    s = sub.add_parser("setup", help="find the fan headers and write the config (root)")
-    for role in ("intake", "exhaust", "radiator", "pump"):
-        s.add_argument(f"--{role}", type=int, action="append", metavar="HEADER",
-                       help=f"a header with {role} fans (skips probing)" if role != "pump"
-                       else "a pump header, never written")
+    s = sub.add_parser("setup", help="find the pump and the fans and write the config (root)")
+    s.add_argument("--pump", type=int, action="append", metavar="HEADER",
+                   help="a pump header, never written (instead of finding them)")
+    s.add_argument("--fans", type=int, action="append", metavar="HEADER",
+                   help="a fan header (default: every header that is not a pump)")
     s.add_argument("--group", help="the group allowed to use the socket (default: yours)")
     sub.add_parser("headers", help="list the fan headers")
     sub.add_parser("release", help="hand every configured header back to the BIOS")

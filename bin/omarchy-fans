@@ -5,7 +5,7 @@
   omarchy-fans profile [NAME]           quiet | balanced | cool | max | bios
   omarchy-fans boost DUTY [DURATION]    e.g. `boost 100 15m`; `boost off` ends it
   omarchy-fans curve show [GROUP]       the curves in use
-  omarchy-fans curve set GROUP SOURCE POINTS   e.g. `curve set intake gpu 40:40,60:65,72:100`
+  omarchy-fans curve set GROUP SOURCE POINTS   e.g. `curve set fans gpu 40:40,60:65,72:100`
   omarchy-fans curve reset [GROUP [SOURCE]]
   omarchy-fans watch [--json]           one line per update
   omarchy-fans setup [ARGS]             find the fan headers (runs `sudo omarchy-fansd setup`)
@@ -150,7 +150,7 @@ def main():
             show(reply, as_json, curves_text(reply.get("status", {}), rest[1] if len(rest) > 1 else None))
         elif sub == "set":
             if len(rest) != 4:
-                fail("curve set GROUP SOURCE POINTS, e.g. curve set intake gpu 40:40,60:65,72:100")
+                fail("curve set GROUP SOURCE POINTS, e.g. curve set fans gpu 40:40,60:65,72:100")
             show(request({"cmd": "curve", "group": rest[1], "source": rest[2],
                           "points": parse_points(rest[3])}), as_json)
         elif sub == "reset":
